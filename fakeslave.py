@@ -3,6 +3,8 @@ import sys
 import socket
 from collections import namedtuple
 
+from rdbtools import RdbParser, ProtocolCallback
+
 
 AGAIN = namedtuple('Again', 'foo')
 PSYNC_FULLRESYNC = b'FULLRESYNC'
@@ -96,7 +98,7 @@ class SyncSession(object):
         if not d:
             return None
         self.data += d
-        print('===', d, '===')
+        # print('===', d, '===')
         return len(d)
 
     def write(self, data):
@@ -125,6 +127,7 @@ class FakeSlave(object):
             session.start_fullsync()
         elif self.state == self.STATE_CONTINUE:
             assert None not in (self.runid, self.reploff), (self.runid, self.reploff)
+            # self.reploff is the index of last received byte
             session.start_psync(self.runid, self.reploff + 1)
 
         psync_received = False
@@ -163,6 +166,7 @@ class FakeSlave(object):
                     print(session.data[:pos])
                     print('rdb: ', self.rdb)
                     session.data = session.data[pos:]
+                    rdb_handler(self.rdb)
                 else:
                     continue
 
@@ -229,6 +233,16 @@ def parse_rdb_bulk_str(buf):
         if len(s) == l:
             break
     return s
+
+
+def rdb_handler(rdb):
+    buf = io.BytesIO()
+    callback = ProtocolCallback(out=buf)
+    parser = RdbParser(callback)
+    mem_fd = io.BytesIO(rdb)
+    parser.parse_fd(mem_fd)
+    print(buf.getvalue())
+    print("parse rdb end")
 
 
 def cmd_handler(cmd, session, fakeslave):
