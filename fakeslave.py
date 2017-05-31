@@ -5,6 +5,8 @@ from collections import namedtuple
 
 
 AGAIN = namedtuple('Again', 'foo')
+PSYNC_FULLRESYNC = b'FULLRESYNC'
+PSYNC_CONTITNUE = b'CONTINUE'
 
 
 def parse_redis_cmd(data):
@@ -72,63 +74,137 @@ def encode_command(*cmd_list):
     return packet.encode('utf-8')
 
 
-def fullsync(host, port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((host, port))
-    s.send(encode_command("PSYNC", "?", "-1"))
-    print('waiting result')
-    data = b''
-    runid = None
-    reploff = None
-    rdb = None
-    while True:
-        d = s.recv(1024)
-        # print(d)
+class SyncSession(object):
+    def __init__(self, master_host, master_port):
+        self.master_host = master_host
+        self.master_port = master_port
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.data = b''
+
+    def start_fullsync(self):
+        self.s.connect((self.master_host, self.master_port))
+        print('request full sync')
+        self.s.send(encode_command("PSYNC", "?", "-1"))
+
+    def start_psync(self, runid, reploff):
+        self.s.connect((self.master_host, self.master_port))
+        print('request psync {} {}'.format(runid, reploff))
+        self.s.send(encode_command("PSYNC", runid, str(reploff)))
+
+    def read(self):
+        d = self.s.recv(1024)
         if not d:
-            print("recv end")
-            break
-        data += d
-        if reploff is not None:
-            reploff += len(d)
+            return None
+        self.data += d
+        print('===', d, '===')
+        return len(d)
 
-        if runid is None:
-            runid, reploff, pos = parse_fullresync(data)
-            if runid is not None:
-                print(data[:pos])
-                print('runid, reploff', runid, reploff)
-                data = data[pos:]
-            continue
+    def write(self, data):
+        self.s.send(data)
 
-        if rdb is None:
-            rdb, pos = parse_rdb(data)
-            if rdb is not None:
-                print(data[:pos])
-                print('rdb:', rdb)
-                data = data[pos:]
 
-        if rdb is None:
-            continue
+class FakeSlave(object):
+    STATE_START = 0
+    STATE_CONTINUE = 2
 
-        while data:
-            cmd, pos = parse_redis_cmd(data)
-            if cmd is None:
-                break
-            cmd_handler(cmd, s, reploff)
-            data = data[pos:]
+    def __init__(self, master_host, master_port):
+        self.master_host = master_host
+        self.master_port = master_port
+        self.state = self.STATE_START
+        self.runid = None
+        self.reploff = None
+        self.rdb = None
+
+    def loop(self):
+        while True:
+            self.sync_cron()
+
+    def sync_cron(self):
+        session = SyncSession(self.master_host, self.master_port)
+        if self.state == self.STATE_START:
+            session.start_fullsync()
+        elif self.state == self.STATE_CONTINUE:
+            assert None not in (self.runid, self.reploff), (self.runid, self.reploff)
+            session.start_psync(self.runid, self.reploff + 1)
+
+        psync_received = False
+
+        while True:
+            dlen = session.read()
+            # print(d)
+            if not dlen:
+                print("session closed")
+                return
+
+            if not psync_received:
+                res = parse_psync_resp(session.data)
+                if res == AGAIN:
+                    continue
+                elif res[0] == PSYNC_CONTITNUE:
+                    assert len(res) == 2
+                    pos = res[1]
+                    session.data = session.data[pos:]
+                    print('CONTINUE')
+                else:
+                    self.runid, self.reploff, pos = res
+                    assert None not in (self.runid, self.reploff)
+                    print(session.data[:pos])
+                    print('runid, reploff', self.runid, self.reploff)
+                    session.data = session.data[pos:]
+                    self.state = self.STATE_START
+                    self.rdb = None
+                psync_received = True
+
+            assert self.runid
+
+            if self.rdb is None:
+                self.rdb, pos = parse_rdb(session.data)
+                if self.rdb is not None:
+                    print(session.data[:pos])
+                    print('rdb: ', self.rdb)
+                    session.data = session.data[pos:]
+                else:
+                    continue
+
+            self.state = self.STATE_CONTINUE
+
+            while session.data:
+                cmd, pos = parse_redis_cmd(session.data)
+                if cmd is None:
+                    break
+                cmd_handler(cmd, session, self)
+                self.reploff += pos
+                session.data = session.data[pos:]
+
+
+def parse_psync_resp(data):
+    rslt, pos = parse_simple_string(data)
+    if rslt is AGAIN:
+        return AGAIN
+    assert b'+' == rslt[0:1]
+    rslt = rslt[1:]  # remove '+'
+    if rslt.startswith(PSYNC_CONTITNUE):
+        return PSYNC_CONTITNUE, pos
+    elif rslt.startswith(PSYNC_FULLRESYNC):
+        res = list(parse_fullresync(rslt))
+        res.append(pos)
+        return res
+    raise Exception("invalid data: {}".format(rslt))
+
+
+def parse_simple_string(data):
+    CRLF = b'\r\n'
+    if CRLF not in data:
+        return AGAIN
+    pos = data.index(CRLF)
+    return data[:pos], pos + 2
 
 
 def parse_fullresync(data):
-    CRLF = b'\r\n'
-    if CRLF not in data:
-        return None, None, None
-    pos = data.index(CRLF)
-    head = '+FULLRESYNC '
-    head_len = len(head)
-    assert data[:head_len].decode('utf-8') == head, data
-    res = data[head_len:pos]
-    pos += len(CRLF)
+    head_len = len(PSYNC_FULLRESYNC) + 1  # 1 for space
+    res = data[head_len:]
     runid, reploff = res.split(b' ')
-    return runid.decode('utf-8'), int(reploff.decode('utf-8')), pos
+    return runid.decode('utf-8'), int(reploff.decode('utf-8'))
 
 
 def parse_rdb(data):
@@ -155,19 +231,19 @@ def parse_rdb_bulk_str(buf):
     return s
 
 
-def cmd_handler(cmd, s, reploff):
+def cmd_handler(cmd, session, fakeslave):
     print(cmd)
     if cmd[0] == b'REPLCONF' and cmd[1] == b'GETACK':
-        send_reploff(s, reploff)
+        send_reploff(session, fakeslave)
     elif cmd[0] in (b'SELECT', b'PING'):
         pass
     else:
         redirect_cmd(cmd)
 
 
-def send_reploff(s, reploff):
+def send_reploff(session, fakeslave):
     print('sendding replconf ack')
-    s.send(encode_command('REPLCONF', 'ACK', str(reploff)))
+    session.write(encode_command('REPLCONF', 'ACK', str(fakeslave.reploff)))
 
 
 def redirect_cmd(cmd):
@@ -176,4 +252,5 @@ def redirect_cmd(cmd):
 
 if __name__ == '__main__':
     _, host, port = sys.argv
-    fullsync(host, int(port))
+    fakeslave = FakeSlave(host, int(port))
+    fakeslave.loop()
