@@ -1,9 +1,15 @@
+import gevent.monkey
+gevent.monkey.patch_all()
 import io
 import sys
 import socket
 from collections import namedtuple
 
 from rdbtools import RdbParser, ProtocolCallback
+import gevent.pool
+
+# private library
+from lanaya.com.RedisWrapper import RedisWrapper, RedisCluster
 
 
 AGAIN = namedtuple('Again', 'foo')
@@ -266,5 +272,9 @@ def redirect_cmd(cmd):
 
 if __name__ == '__main__':
     _, host, port = sys.argv
-    fakeslave = FakeSlave(host, int(port))
-    fakeslave.loop()
+    port = int(port)
+    cluster = RedisCluster.from_node(host, port)
+    masters = [r for r in cluster.redis_list if r.is_master()]
+    fakeslaves = [FakeSlave(m.ip, m.port) for m in masters]
+    pool = gevent.pool.Pool(len(fakeslaves))
+    pool.map(lambda s: s.loop(), fakeslaves)
