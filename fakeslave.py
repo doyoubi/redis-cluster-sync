@@ -65,6 +65,9 @@ def parse_redis_bulk_str(buf):
 
 
 def parse_redis_len(buf, prefix):
+    while len(buf.getvalue()) > buf.tell() and \
+            buf.getvalue()[buf.tell():buf.tell() + 1] == b'\n':
+        buf.read(1)  # pop the \n for ping from master
     if b'\n' not in buf.getvalue()[buf.tell():]:
         return AGAIN
     line = buf.readline()
@@ -78,6 +81,8 @@ def parse_redis_len(buf, prefix):
 def encode_command(*cmd_list):
     packet = "*{}\r\n".format(len(cmd_list))
     for e in cmd_list:
+        if isinstance(e, bytes):
+            e = e.decode('utf-8')
         packet += "${}\r\n{}\r\n".format(len(e), e)
     return packet.encode('utf-8')
 
@@ -140,7 +145,6 @@ class FakeSlave(object):
 
         while True:
             dlen = session.read()
-            # print(d)
             if not dlen:
                 print("session closed")
                 return
@@ -157,7 +161,7 @@ class FakeSlave(object):
                 else:
                     self.runid, self.reploff, pos = res
                     assert None not in (self.runid, self.reploff)
-                    print(session.data[:pos])
+                    # print(session.data[:pos])
                     print('runid, reploff', self.runid, self.reploff)
                     session.data = session.data[pos:]
                     self.state = self.STATE_START
@@ -169,8 +173,8 @@ class FakeSlave(object):
             if self.rdb is None:
                 self.rdb, pos = parse_rdb(session.data)
                 if self.rdb is not None:
-                    print(session.data[:pos])
-                    print('rdb: ', self.rdb)
+                    # print(session.data[:pos])
+                    # print('rdb: ', self.rdb)
                     session.data = session.data[pos:]
                     rdb_handler(self.rdb)
                 else:
@@ -227,6 +231,8 @@ def parse_rdb(data):
 
 def parse_rdb_bulk_str(buf):
     # Not like normal bulk string, without trailing '\r\n'
+    if len(buf.getvalue()) == buf.tell():
+        return AGAIN
     l = parse_redis_len(buf, b'$')
     if l == AGAIN:
         return AGAIN
@@ -247,12 +253,13 @@ def rdb_handler(rdb):
     parser = RdbParser(callback)
     mem_fd = io.BytesIO(rdb)
     parser.parse_fd(mem_fd)
-    print(buf.getvalue())
+    # print(buf.getvalue())
+    redirect_cmd(buf.getvalue())
     print("parse rdb end")
 
 
 def cmd_handler(cmd, session, fakeslave):
-    print(cmd)
+    # print(cmd)
     if cmd[0] == b'REPLCONF' and cmd[1] == b'GETACK':
         send_reploff(session, fakeslave)
     elif cmd[0] in (b'SELECT', b'PING'):
@@ -266,12 +273,34 @@ def send_reploff(session, fakeslave):
     session.write(encode_command('REPLCONF', 'ACK', str(fakeslave.reploff)))
 
 
+dst_host = None
+dst_port = None
+
+
 def redirect_cmd(cmd):
-    print('redirect: ', cmd)
+    if not cmd:
+        return
+    if isinstance(cmd, list):
+        cmd = encode_command(*cmd)
+    dst = RedirectDst(dst_host, dst_port)
+    dst.send(cmd)
+    # print('redirect: ', cmd)
+
+
+class RedirectDst(object):
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.s.connect((host, port))
+
+    def send(self, data):
+        self.s.send(data)
 
 
 if __name__ == '__main__':
-    _, host, port = sys.argv
+    _, host, port, dst_host, dst_port = sys.argv
+
     port = int(port)
     cluster = RedisCluster.from_node(host, port)
     masters = [r for r in cluster.redis_list if r.is_master()]
