@@ -6,6 +6,7 @@ import socket
 from collections import namedtuple
 
 from rdbtools import RdbParser, ProtocolCallback
+import gevent
 import gevent.pool
 
 # private library
@@ -93,27 +94,38 @@ class SyncSession(object):
         self.master_port = master_port
         self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.data = b''
+        self.pong_thread = None
 
     def start_fullsync(self):
         self.s.connect((self.master_host, self.master_port))
         print('request full sync')
         self.s.send(encode_command("PSYNC", "?", "-1"))
+        self.pong_thread = gevent.spawn(self.pong_loop)
 
     def start_psync(self, runid, reploff):
         self.s.connect((self.master_host, self.master_port))
         print('request psync {} {}'.format(runid, reploff))
         self.s.send(encode_command("PSYNC", runid, str(reploff)))
 
+    def close(self):
+        self.pong_thread.kill()
+        self.s.close()
+
     def read(self):
         d = self.s.recv(1024)
         if not d:
             return None
         self.data += d
-        # print('===', d, '===')
+        print('===', d, '===')
         return len(d)
 
     def write(self, data):
         self.s.send(data)
+
+    def pong_loop(self):
+        while True:
+            gevent.sleep(5)
+            self.s.send(b'\n')
 
 
 class FakeSlave(object):
@@ -145,8 +157,9 @@ class FakeSlave(object):
 
         while True:
             dlen = session.read()
-            if not dlen:
+            if dlen == 0:
                 print("session closed")
+                session.close()
                 return
 
             if not psync_received:
@@ -174,7 +187,6 @@ class FakeSlave(object):
                 self.rdb, pos = parse_rdb(session.data)
                 if self.rdb is not None:
                     # print(session.data[:pos])
-                    # print('rdb: ', self.rdb)
                     session.data = session.data[pos:]
                     rdb_handler(self.rdb)
                 else:
@@ -189,6 +201,7 @@ class FakeSlave(object):
                 cmd_handler(cmd, session, self)
                 self.reploff += pos
                 session.data = session.data[pos:]
+        sessionl.close()
 
 
 def parse_psync_resp(data):
@@ -248,12 +261,13 @@ def parse_rdb_bulk_str(buf):
 
 
 def rdb_handler(rdb):
+    print("rdb: ", rdb)
     buf = io.BytesIO()
     callback = ProtocolCallback(out=buf)
     parser = RdbParser(callback)
     mem_fd = io.BytesIO(rdb)
     parser.parse_fd(mem_fd)
-    # print(buf.getvalue())
+    print('rdb data', buf.getvalue())
     redirect_cmd(buf.getvalue())
     print("parse rdb end")
 
@@ -282,9 +296,9 @@ def redirect_cmd(cmd):
         return
     if isinstance(cmd, list):
         cmd = encode_command(*cmd)
-    dst = RedirectDst(dst_host, dst_port)
-    dst.send(cmd)
-    # print('redirect: ', cmd)
+    # dst = RedirectDst(dst_host, dst_port)
+    # dst.send(cmd)
+    print('redirect: ', cmd)
 
 
 class RedirectDst(object):
@@ -305,5 +319,7 @@ if __name__ == '__main__':
     cluster = RedisCluster.from_node(host, port)
     masters = [r for r in cluster.redis_list if r.is_master()]
     fakeslaves = [FakeSlave(m.ip, m.port) for m in masters]
+    fakeslaves = [FakeSlave(m.ip, m.port) for m in masters if m.ip == host and m.port == port][:1]
+    print(fakeslaves)
     pool = gevent.pool.Pool(len(fakeslaves))
     pool.map(lambda s: s.loop(), fakeslaves)
